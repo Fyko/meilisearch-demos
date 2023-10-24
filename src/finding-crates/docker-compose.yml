@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  indexer:
+    build:
+      context: .
+    env_file: .env
+    command: init
+    environment:
+      MEILI_HOST_URL: "${MEILI_HOST_URL:-http://meilisearch:7700}"
+      MEILI_INDEX_UID: "${MEILI_INDEX_UID:-crates}"
+      MEILI_API_KEY: "${MEILI_MASTER_KEY-admin}"
+    restart: unless-stopped
+
+  meilisearch:
+    image: getmeili/meilisearch
+    restart: unless-stopped
+    volumes:
+      - meilisearch-data:/data.ms
+    env_file: .env
+    environment:
+      MEILI_MASTER_KEY: "${MEILI_MASTER_KEY-admin}"
+      MEILI_LOG_LEVEL: "${MEILI_LOG_LEVEL-info}"
+    healthcheck:
+      test: ["CMD", "curl", "-s", "$MEILI_HOST_URL/health"]
+      retries: 10
+      timeout: 5s
+    ports:
+      - '$MEILI_HOST_PORT:7700'
+
+volumes:
+  meilisearch-data:

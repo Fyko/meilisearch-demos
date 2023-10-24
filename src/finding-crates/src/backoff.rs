@@ -11,6 +11,12 @@ impl Fibonacci {
     }
 }
 
+impl Default for Fibonacci {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Iterator for Fibonacci {
     type Item = u32;
     fn next(&mut self) -> Option<u32> {
@@ -23,7 +29,7 @@ impl Iterator for Fibonacci {
     }
 }
 
-pub fn new() -> impl Iterator<Item=u32> {
+pub fn new() -> impl Iterator<Item = u32> {
     // fib(21) = 10946
-    Fibonacci::new().take(10).chain(iter::repeat(10))
+    Fibonacci::default().take(10).chain(iter::repeat(10))
 }

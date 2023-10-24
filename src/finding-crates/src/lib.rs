@@ -1,25 +1,21 @@
-use std::env;
-use std::error::Error;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
+use color_eyre::{Result, eyre::eyre};
 
-use futures::channel::mpsc;
+use config::CONFIG;
+use flate2::bufread::GzDecoder;
+use futures::{channel::mpsc};
 use futures::stream::StreamExt;
 use futures_timer::Delay;
 
 use cargo_toml::Manifest;
-use flate2::read::GzDecoder;
-use isahc::prelude::*;
-use serde::{Serialize, Deserialize};
+use meilisearch_sdk::Client;
+use serde::{Deserialize, Serialize};
 use tar::Archive;
 
-pub const MEILI_HOST_URL: &str = "MEILI_HOST_URL";
-pub const MEILI_INDEX_UID: &str = "MEILI_INDEX_UID";
-pub const MEILI_API_KEY: &str = "MEILI_API_KEY";
-
+pub mod config;
 pub mod backoff;
-
-pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug, Deserialize)]
 pub struct CrateInfo {
@@ -52,35 +48,41 @@ pub async fn retrieve_crate_toml(info: &CrateInfo) -> Result<CompleteCrateInfos>
 
     let mut result = None;
     for multiplier in backoff::new().take(10) {
-        match isahc::get_async(&url).await {
-            Ok(res) => { result = Some(res); break },
+        match reqwest::get(&url).await {
+            Ok(res) => {
+                result = Some(res);
+                break;
+            }
             Err(e) => {
                 let dur = Duration::from_secs(1) * (multiplier + 1);
-                eprintln!("error downloading {} {} retrying in {:.2?}", url, e, dur);
+                tracing::warn!("error downloading {} {} retrying in {:.2?}", url, e, dur);
                 let _ = Delay::new(dur).await;
-            },
+            }
         }
     }
 
-    let mut res = match result {
+    let res = match result {
         Some(res) => res,
-        None => return Err(format!("Could not download {}", url).into()),
+        None => return Err(color_eyre::eyre::eyre!("Could not download {}", url)),
     };
 
     if !res.status().is_success() {
-        let body = res.text()?;
-        return Err(format!("{}", body).into());
+        let body = res.text().await?;
+        return Err(eyre!("Could not download {}: {}", url, body));
     }
 
-    let gz = GzDecoder::new(res.into_body());
-    let mut tar = Archive::new(gz);
+    let bytes = res.bytes().await?;
+    let archive = GzDecoder::new(&bytes[..]);
+    let mut tar = Archive::new(archive);
 
     let mut toml_infos = None;
     let mut readme = None;
 
     for res in tar.entries()? {
         // stop early if we found both files
-        if toml_infos.is_some() && readme.is_some() { break }
+        if toml_infos.is_some() && readme.is_some() {
+            break;
+        }
 
         let mut entry = res?;
         let path = entry.path()?;
@@ -103,14 +105,8 @@ pub async fn retrieve_crate_toml(info: &CrateInfo) -> Result<CompleteCrateInfos>
                 let categories = package.categories;
                 let version = info.vers.clone();
 
-                toml_infos = Some((
-                    name,
-                    description,
-                    keywords,
-                    categories,
-                    version,
-                ));
-            },
+                toml_infos = Some((name, description, keywords, categories, version));
+            }
             Some("README.md") if readme.is_none() => {
                 let mut content = String::new();
                 entry.read_to_string(&mut content)?;
@@ -123,7 +119,7 @@ pub async fn retrieve_crate_toml(info: &CrateInfo) -> Result<CompleteCrateInfos>
                 let text = html.text().collect();
 
                 readme = Some(text);
-            },
+            }
             _ => (),
         }
     }
@@ -132,78 +128,65 @@ pub async fn retrieve_crate_toml(info: &CrateInfo) -> Result<CompleteCrateInfos>
         (Some((name, description, keywords, categories, version)), readme) => {
             Ok(CompleteCrateInfos {
                 name,
-                description,
-                keywords,
-                categories,
+                description: description.get().unwrap_or(&"".to_string()).to_string(),
+                keywords: keywords.get().unwrap_or(&vec![]).to_vec(),
+                categories: categories.get().unwrap_or(&vec![]).to_vec(),
                 readme: readme.unwrap_or_default(),
                 version,
             })
-        },
-        (None, _) => Err(String::from("No Cargo.toml found in this crate").into()),
+        }
+        (None, _) => Err(eyre!("No Cargo.toml found in this crate")),
     }
-
 }
 
+// something in here is causing a rucus
 pub async fn chunk_complete_crates_info_to_meili(
+    client: Arc<Client>,
     receiver: mpsc::Receiver<CompleteCrateInfos>,
-) -> Result<()>
-{
-    let api_key = env::var(MEILI_API_KEY).expect(MEILI_API_KEY);
-    let index_uid = env::var(MEILI_INDEX_UID).expect(MEILI_INDEX_UID);
-    let host_url = env::var(MEILI_HOST_URL).expect(MEILI_HOST_URL);
+) -> Result<()> {
+    let index = client.index(CONFIG.meili_index_uid.clone());
 
-    let client = HttpClient::new()?;
-
+    let mut chunk_count = 0;
     let mut receiver = receiver.chunks(100);
     while let Some(chunk) = StreamExt::next(&mut receiver).await {
-        let url = format!("{host_url}/indexes/{index_uid}/documents",
-            host_url = host_url,
-            index_uid = index_uid,
-        );
+        tracing::debug!("chunk {chunk_count} len: {}", chunk.len());
+        chunk_count += 1;
 
-        let chunk_json = serde_json::to_string(&chunk)?;
-
-        let request = Request::put(url)
-            .header("X-Meili-API-Key", &api_key)
-            .header("Content-Type", "application/json")
-            .body(chunk_json)?;
-
-        let mut res = client.send_async(request).await?;
-        let res = res.text()?;
-        eprintln!("{}", res);
+        let task = index.add_or_update(&chunk, Some("name")).await?;
+        let res = client.wait_for_task(task, None, None).await?;
+        tracing::debug!("{res:#?}");
     }
 
     Ok(())
 }
 
 pub async fn chunk_downloads_crates_info_to_meili(
+    client: Arc<Client>,
     receiver: mpsc::Receiver<DownloadsCrateInfos>,
-) -> Result<()>
-{
-    let api_key = env::var(MEILI_API_KEY).expect(MEILI_API_KEY);
-    let index_uid = env::var(MEILI_INDEX_UID).expect(MEILI_INDEX_UID);
-    let host_url = env::var(MEILI_HOST_URL).expect(MEILI_HOST_URL);
-
-    let client = HttpClient::new()?;
+) -> Result<()> {
+    let index = client.index(CONFIG.meili_index_uid.clone());
 
     let mut receiver = receiver.chunks(150);
     while let Some(chunk) = StreamExt::next(&mut receiver).await {
-        let url = format!("{host_url}/indexes/{index_uid}/documents",
-            host_url = host_url,
-            index_uid = index_uid,
-        );
-
-        let chunk_json = serde_json::to_string(&chunk)?;
-
-        let request = Request::put(url)
-            .header("X-Meili-API-Key", &api_key)
-            .header("Content-Type", "application/json")
-            .body(chunk_json)?;
-
-        let mut res = client.send_async(request).await?;
-        let res = res.text()?;
-        eprintln!("{}", res);
+        let task = index.add_or_update(&chunk, Some("name")).await?;
+        let res = client.wait_for_task(task, None, None).await?;
+        tracing::info!("{res:#?}");
     }
 
     Ok(())
+}
+
+pub fn create_meilisearch_client() -> Arc<Client> {
+    Arc::new(Client::new(CONFIG.meili_host_url.clone(), Some(CONFIG.meili_api_key.clone())))
+}
+
+pub fn init_logging() {
+    color_eyre::install().expect("failed to install color_eyre");
+
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
+
+    Registry::default()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,html5ever=info,isahc=info".into()))
+        .with(fmt::layer())
+        .init();
 }
